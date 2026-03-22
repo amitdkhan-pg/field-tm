@@ -351,6 +351,7 @@ class FMTMSplitter:
         self,
         db: Union[str, Connection],
         buildings: Optional[int] = None,
+        enumerators: Optional[int] = None,
         osm_extract: Optional[Union[dict, FeatureCollection]] = None,
     ) -> FeatureCollection:
         """Split the polygon by features in the database using an SQL query.
@@ -362,6 +363,7 @@ class FMTMSplitter:
                 Passing an connection object prevents requiring additional
                 database connections to be spawned.
             buildings (int): The number of buildings in each task
+            TODO: enumerators
             osm_extract (dict, FeatureCollection): an OSM extract geojson,
                 containing building polygons, or linestrings.
 
@@ -369,7 +371,7 @@ class FMTMSplitter:
             data (FeatureCollection): A multipolygon of all the task boundaries.
         """
         # Validation
-        if buildings and not osm_extract:
+        if (buildings or enumerators) and not osm_extract:
             # TODO handle other algorithms
             msg = (
                 "To use the FMTM splitting algo, an OSM data extract must be passed "
@@ -441,6 +443,17 @@ class FMTMSplitter:
             CROSS JOIN (SELECT geom FROM project_aoi LIMIT 1) p
             WHERE ST_Intersects(p.geom, w.geom)
         """)
+
+        # Make the input parameters accessible to other sql files.
+        cur.execute(
+            f"SET area_splitter.num_buildings = "
+            f"{buildings if buildings is not None else 0}"
+        )
+        cur.execute(
+            f"SET area_splitter.num_enumerators = "
+            f"{enumerators if enumerators is not None else 0}"
+        )
+
         # Close current cursor
         cur.close()
 
@@ -461,12 +474,7 @@ class FMTMSplitter:
         algorithms_path = str(Path(__file__).parent / "algorithms")
         for sql_file in sql_files:
             with open(f"{algorithms_path}/{sql_file}") as raw_sql:
-                query = raw_sql.read()
-                # NOTE can't substitute params into multi statement file
-                # splitter_cursor.execute(sql, {"num_buildings": buildings})
-                # Replace num_buildings param to avoid issues on execute
-                sql_content = query.replace("%(num_buildings)s", str(buildings))
-                splitter_cursor.execute(sql_content)
+                splitter_cursor.execute(raw_sql.read())
 
         features = splitter_cursor.fetchall()[0][0]["features"]
         if features:
@@ -606,6 +614,7 @@ def split_by_sql(
     aoi: Union[str, FeatureCollection],
     db: Union[str, Connection],
     num_buildings: Optional[int] = None,
+    num_enumerators: Optional[int] = None,
     outfile: Optional[str] = None,
     osm_extract: Optional[Union[str, FeatureCollection]] = None,
 ) -> FeatureCollection:
@@ -616,7 +625,7 @@ def split_by_sql(
         number of buildings from `num_buildings`.
     - Split the task areas on major features such as roads an rivers, to
       avoid traversal of these features across task areas.
-
+    TODO: enumerators
     Also has handling for multiple geometries within FeatureCollection object.
 
     Args:
@@ -639,8 +648,10 @@ def split_by_sql(
     Returns:
         features (FeatureCollection): A multipolygon of all the task boundaries.
     """
-    if not num_buildings:
-        err = "num_buildings must be passed, until other algorithms are implemented."
+    if (not num_buildings and not num_enumerators) or (
+        num_buildings and num_enumerators
+    ):
+        err = "Exactly one out of num_buildings and num_enumerators must be passed."
         log.error(err)
         raise ValueError(err)
 
@@ -697,6 +708,7 @@ def split_by_sql(
                 FeatureCollection(features=[feat]),
                 db,
                 num_buildings,
+                num_enumerators,
                 f"{Path(outfile).stem}_{index}.geojson)" if outfile else None,
                 osm_extract,
             )
@@ -708,7 +720,7 @@ def split_by_sql(
     else:
         splitter = FMTMSplitter(aoi_featcol)
         split_features = splitter.splitBySQL(
-            db, num_buildings, osm_extract=extract_geojson
+            db, num_buildings, num_enumerators, osm_extract=extract_geojson
         )
         if not split_features:
             msg = "Failed to generate split features."
@@ -841,6 +853,7 @@ be either the data extract used by the XLSForm, or a postgresql database.
     parser.add_argument(
         "-number", "--number", nargs="?", const=5, help="Number of buildings in a task"
     )
+    parser.add_argument("-tasks", "--tasks", nargs="?", const=5, help="Number of tasks")
     parser.add_argument("-b", "--boundary", required=True, help="Polygon AOI")
     parser.add_argument("-s", "--source", help="Source data, Geojson or PG:[dbname]")
     parser.add_argument(
@@ -889,6 +902,16 @@ be either the data extract used by the XLSForm, or a postgresql database.
             args.boundary,
             db=args.dburl,
             num_buildings=args.number,
+            num_enumerators=0,
+            outfile=args.outfile,
+            osm_extract=args.extract,
+        )
+    elif args.tasks:
+        split_by_sql(
+            args.boundary,
+            db=args.dburl,
+            num_buildings=0,
+            num_enumerators=args.tasks,
             outfile=args.outfile,
             osm_extract=args.extract,
         )
